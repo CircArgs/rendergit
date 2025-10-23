@@ -35,7 +35,8 @@ MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
 @dataclass
 class RenderDecision:
     include: bool
-    reason: str  # "ok" | "binary" | "too_large" | "ignored"
+    # "ok" | "binary" | "too_large" | "ignored" | "excluded_glob" | "included_glob"
+    reason: str
 
 @dataclass
 class FileInfo:
@@ -94,37 +95,64 @@ def looks_binary(path: pathlib.Path) -> bool:
         # If unreadable, treat as binary to be safe
         return True
 
-
-def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int) -> FileInfo:
-    rel = str(path.relative_to(repo_root)).replace(os.sep, "/")
+# --- Modified Function Signature and Logic for Globs ---
+def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int,
+                include_globs: List[str], exclude_globs: List[str]) -> FileInfo:
+    rel_path_obj = path.relative_to(repo_root)
+    rel = str(rel_path_obj).replace(os.sep, "/")
     try:
         size = path.stat().st_size
     except FileNotFoundError:
         size = 0
-    # Ignore VCS and build junk
+
+    # 1. Ignore VCS and build junk (precedence 1)
     if "/.git/" in f"/{rel}/" or rel.startswith(".git/"):
         return FileInfo(path, rel, size, RenderDecision(False, "ignored"))
+
+    # 2. Check exclusion globs (precedence 2)
+    # Use PurePath for matching the relative path string
+    for glob in exclude_globs:
+        if pathlib.PurePath(rel).match(glob):
+            return FileInfo(path, rel, size, RenderDecision(False, "excluded_glob"))
+
+    # 3. Check inclusion globs (precedence 3)
+    if include_globs:
+        is_included = False
+        for glob in include_globs:
+            if pathlib.PurePath(rel).match(glob):
+                is_included = True
+                break
+        if not is_included:
+            # File is NOT matched by any include glob, so exclude it.
+            return FileInfo(path, rel, size, RenderDecision(False, "included_glob"))
+
+    # 4. Check size and binary status (precedence 4)
     if size > max_bytes:
         return FileInfo(path, rel, size, RenderDecision(False, "too_large"))
     if looks_binary(path):
         return FileInfo(path, rel, size, RenderDecision(False, "binary"))
+
+    # 5. Passed all checks
     return FileInfo(path, rel, size, RenderDecision(True, "ok"))
 
 
-def collect_files(repo_root: pathlib.Path, max_bytes: int) -> List[FileInfo]:
+def collect_files(repo_root: pathlib.Path, max_bytes: int,
+                  include_globs: List[str], exclude_globs: List[str]) -> List[FileInfo]:
     infos: List[FileInfo] = []
     for p in sorted(repo_root.rglob("*")):
         if p.is_symlink():
             continue
         if p.is_file():
-            infos.append(decide_file(p, repo_root, max_bytes))
+            # Pass globs to decide_file
+            infos.append(decide_file(p, repo_root, max_bytes, include_globs, exclude_globs))
     return infos
-
+# -----------------------------------------------------------------------------
 
 def generate_tree_fallback(root: pathlib.Path) -> str:
     """Minimal tree-like output if `tree` command is missing."""
     lines: List[str] = []
-    prefix_stack: List[str] = []
+    # Removed prefix_stack as it was unused
+    # prefix_stack: List[str] = []
 
     def walk(dir_path: pathlib.Path, prefix: str = ""):
         entries = [e for e in dir_path.iterdir() if e.name != ".git"]
@@ -209,7 +237,12 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
     skipped_binary = [i for i in infos if i.decision.reason == "binary"]
     skipped_large = [i for i in infos if i.decision.reason == "too_large"]
     skipped_ignored = [i for i in infos if i.decision.reason == "ignored"]
-    total_files = len(rendered) + len(skipped_binary) + len(skipped_large) + len(skipped_ignored)
+    # New skipped reasons
+    skipped_excluded_glob = [i for i in infos if i.decision.reason == "excluded_glob"]
+    skipped_included_glob = [i for i in infos if i.decision.reason == "included_glob"]
+
+    total_files = len(rendered) + len(skipped_binary) + len(skipped_large) + len(skipped_ignored) \
+        + len(skipped_excluded_glob) + len(skipped_included_glob)
 
     # Directory tree
     tree_text = try_tree_command(repo_dir)
@@ -244,9 +277,9 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
             body_html = f'<pre class="error">Failed to render: {html.escape(str(e))}</pre>'
         sections.append(f"""
 <section class="file-section" id="file-{anchor}">
-  <h2>{html.escape(i.rel)} <span class="muted">({bytes_human(i.size)})</span></h2>
-  <div class="file-body">{body_html}</div>
-  <div class="back-top"><a href="#top">↑ Back to top</a></div>
+    <h2>{html.escape(i.rel)} <span class="muted">({bytes_human(i.size)})</span></h2>
+    <div class="file-body">{body_html}</div>
+    <div class="back-top"><a href="#top">↑ Back to top</a></div>
 </section>
 """)
 
@@ -264,12 +297,15 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
             f"<ul class='skip-list'>\n" + "\n".join(lis) + "\n</ul></details>"
         )
 
+    # Updated skipped_html to include new glob-based skips
     skipped_html = (
+        render_skip_list("Skipped: Excluded by glob pattern", skipped_excluded_glob) +
+        render_skip_list("Skipped: Not matched by include glob pattern", skipped_included_glob) +
         render_skip_list("Skipped binaries", skipped_binary) +
         render_skip_list("Skipped large files", skipped_large)
     )
 
-    # HTML with left sidebar TOC
+    # HTML with left sidebar TOC (rest of build_html is unchanged)
     return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -278,176 +314,176 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Flattened repo – {html.escape(repo_url)}</title>
 <style>
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, 'Apple Color Emoji','Segoe UI Emoji';
-    margin: 0; padding: 0; line-height: 1.45;
-  }}
-  .container {{ max-width: 1100px; margin: 0 auto; padding: 0 1rem; }}
-  .meta small {{ color: #666; }}
-  .counts {{ margin-top: 0.25rem; color: #333; }}
-  .muted {{ color: #777; font-weight: normal; font-size: 0.9em; }}
+    body {{
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, 'Apple Color Emoji','Segoe UI Emoji';
+        margin: 0; padding: 0; line-height: 1.45;
+    }}
+    .container {{ max-width: 1100px; margin: 0 auto; padding: 0 1rem; }}
+    .meta small {{ color: #666; }}
+    .counts {{ margin-top: 0.25rem; color: #333; }}
+    .muted {{ color: #777; font-weight: normal; font-size: 0.9em; }}
 
-  /* Layout with sidebar */
-  .page {{ display: grid; grid-template-columns: 320px minmax(0,1fr); gap: 0; }}
-  #sidebar {{
-    position: sticky; top: 0; align-self: start;
-    height: 100vh; overflow: auto;
-    border-right: 1px solid #eee; background: #fafbfc;
-  }}
-  #sidebar .sidebar-inner {{ padding: 0.75rem; }}
-  #sidebar h2 {{ margin: 0 0 0.5rem 0; font-size: 1rem; }}
+    /* Layout with sidebar */
+    .page {{ display: grid; grid-template-columns: 320px minmax(0,1fr); gap: 0; }}
+    #sidebar {{
+        position: sticky; top: 0; align-self: start;
+        height: 100vh; overflow: auto;
+        border-right: 1px solid #eee; background: #fafbfc;
+    }}
+    #sidebar .sidebar-inner {{ padding: 0.75rem; }}
+    #sidebar h2 {{ margin: 0 0 0.5rem 0; font-size: 1rem; }}
 
-  .toc {{ list-style: none; padding-left: 0; margin: 0; overflow-x: auto; }}
-  .toc li {{ padding: 0.15rem 0; white-space: nowrap; }}
-  .toc a {{ text-decoration: none; color: #0366d6; display: inline-block; text-decoration: none; }}
-  .toc a:hover {{ text-decoration: underline; }}
+    .toc {{ list-style: none; padding-left: 0; margin: 0; overflow-x: auto; }}
+    .toc li {{ padding: 0.15rem 0; white-space: nowrap; }}
+    .toc a {{ text-decoration: none; color: #0366d6; display: inline-block; text-decoration: none; }}
+    .toc a:hover {{ text-decoration: underline; }}
 
-  main.container {{ padding-top: 1rem; }}
+    main.container {{ padding-top: 1rem; }}
 
-  pre {{ background: #f6f8fa; padding: 0.75rem; overflow: auto; border-radius: 6px; }}
-  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace; }}
-  .highlight {{ overflow-x: auto; }}
-  .file-section {{ padding: 1rem; border-top: 1px solid #eee; }}
-  .file-section h2 {{ margin: 0 0 0.5rem 0; font-size: 1.1rem; }}
-  .file-body {{ margin-bottom: 0.5rem; }}
-  .back-top {{ font-size: 0.9rem; }}
-  .skip-list code {{ background: #f6f8fa; padding: 0.1rem 0.3rem; border-radius: 4px; }}
-  .error {{ color: #b00020; background: #fff3f3; }}
+    pre {{ background: #f6f8fa; padding: 0.75rem; overflow: auto; border-radius: 6px; }}
+    code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace; }}
+    .highlight {{ overflow-x: auto; }}
+    .file-section {{ padding: 1rem; border-top: 1px solid #eee; }}
+    .file-section h2 {{ margin: 0 0 0.5rem 0; font-size: 1.1rem; }}
+    .file-body {{ margin-bottom: 0.5rem; }}
+    .back-top {{ font-size: 0.9rem; }}
+    .skip-list code {{ background: #f6f8fa; padding: 0.1rem 0.3rem; border-radius: 4px; }}
+    .error {{ color: #b00020; background: #fff3f3; }}
 
-  /* Hide duplicate top TOC on wide screens */
-  .toc-top {{ display: block; }}
-  @media (min-width: 1000px) {{ .toc-top {{ display: none; }} }}
+    /* Hide duplicate top TOC on wide screens */
+    .toc-top {{ display: block; }}
+    @media (min-width: 1000px) {{ .toc-top {{ display: none; }} }}
 
-  :target {{ scroll-margin-top: 8px; }}
+    :target {{ scroll-margin-top: 8px; }}
 
-  /* View toggle */
-  .view-toggle {{
-    margin: 1rem 0;
-    display: flex;
-    gap: 0.5rem;
-    align-items: center;
-  }}
-  .toggle-btn {{
-    padding: 0.5rem 1rem;
-    border: 1px solid #d1d9e0;
-    background: white;
-    cursor: pointer;
-    border-radius: 6px;
-    font-size: 0.9rem;
-  }}
-  .toggle-btn.active {{
-    background: #0366d6;
-    color: white;
-    border-color: #0366d6;
-  }}
-  .toggle-btn:hover:not(.active) {{
-    background: #f6f8fa;
-  }}
+    /* View toggle */
+    .view-toggle {{
+        margin: 1rem 0;
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+    }}
+    .toggle-btn {{
+        padding: 0.5rem 1rem;
+        border: 1px solid #d1d9e0;
+        background: white;
+        cursor: pointer;
+        border-radius: 6px;
+        font-size: 0.9rem;
+    }}
+    .toggle-btn.active {{
+        background: #0366d6;
+        color: white;
+        border-color: #0366d6;
+    }}
+    .toggle-btn:hover:not(.active) {{
+        background: #f6f8fa;
+    }}
 
-  /* LLM view */
-  #llm-view {{ display: none; }}
-  #llm-text {{
-    width: 100%;
-    height: 70vh;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 0.85em;
-    border: 1px solid #d1d9e0;
-    border-radius: 6px;
-    padding: 1rem;
-    resize: vertical;
-  }}
-  .copy-hint {{
-    margin-top: 0.5rem;
-    color: #666;
-    font-size: 0.9em;
-  }}
+    /* LLM view */
+    #llm-view {{ display: none; }}
+    #llm-text {{
+        width: 100%;
+        height: 70vh;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.85em;
+        border: 1px solid #d1d9e0;
+        border-radius: 6px;
+        padding: 1rem;
+        resize: vertical;
+    }}
+    .copy-hint {{
+        margin-top: 0.5rem;
+        color: #666;
+        font-size: 0.9em;
+    }}
 
-  /* Pygments */
-  {pygments_css}
+    /* Pygments */
+    {pygments_css}
 </style>
 </head>
 <body>
 <a id="top"></a>
 
 <div class="page">
-  <nav id="sidebar"><div class="sidebar-inner">
-      <h2>Contents ({len(rendered)})</h2>
-      <ul class="toc toc-sidebar">
-        <li><a href="#top">↑ Back to top</a></li>
-        {toc_html}
-      </ul>
-  </div></nav>
+    <nav id="sidebar"><div class="sidebar-inner">
+        <h2>Contents ({len(rendered)})</h2>
+        <ul class="toc toc-sidebar">
+            <li><a href="#top">↑ Back to top</a></li>
+            {toc_html}
+        </ul>
+    </div></nav>
 
-  <main class="container">
+    <main class="container">
 
-    <section>
-        <div class="meta">
-        <div><strong>Repository:</strong> <a href="{html.escape(repo_url)}">{html.escape(repo_url)}</a></div>
-        <small><strong>HEAD commit:</strong> {html.escape(head_commit)}</small>
-        <div class="counts">
-            <strong>Total files:</strong> {total_files} · <strong>Rendered:</strong> {len(rendered)} · <strong>Skipped:</strong> {len(skipped_binary) + len(skipped_large) + len(skipped_ignored)}
+        <section>
+            <div class="meta">
+            <div><strong>Repository:</strong> <a href="{html.escape(repo_url)}">{html.escape(repo_url)}</a></div>
+            <small><strong>HEAD commit:</strong> {html.escape(head_commit)}</small>
+            <div class="counts">
+                <strong>Total files:</strong> {total_files} · <strong>Rendered:</strong> {len(rendered)} · <strong>Skipped:</strong> {len(total_files) - len(rendered)}
+            </div>
+            </div>
+        </section>
+
+        <div class="view-toggle">
+            <strong>View:</strong>
+            <button class="toggle-btn active" onclick="showHumanView()">👤 Human</button>
+            <button class="toggle-btn" onclick="showLLMView()">🤖 LLM</button>
         </div>
+
+        <div id="human-view">
+            <section>
+                <h2>Directory tree</h2>
+                <pre>{html.escape(tree_text)}</pre>
+            </section>
+
+            <section class="toc-top">
+                <h2>Table of contents ({len(rendered)})</h2>
+                <ul class="toc">{toc_html}</ul>
+            </section>
+
+            <section>
+                <h2>Skipped items</h2>
+                {skipped_html}
+            </section>
+
+            {''.join(sections)}
         </div>
-    </section>
 
-    <div class="view-toggle">
-      <strong>View:</strong>
-      <button class="toggle-btn active" onclick="showHumanView()">👤 Human</button>
-      <button class="toggle-btn" onclick="showLLMView()">🤖 LLM</button>
-    </div>
-
-    <div id="human-view">
-      <section>
-        <h2>Directory tree</h2>
-        <pre>{html.escape(tree_text)}</pre>
-      </section>
-
-      <section class="toc-top">
-        <h2>Table of contents ({len(rendered)})</h2>
-        <ul class="toc">{toc_html}</ul>
-      </section>
-
-      <section>
-        <h2>Skipped items</h2>
-        {skipped_html}
-      </section>
-
-      {''.join(sections)}
-    </div>
-
-    <div id="llm-view">
-      <section>
-        <h2>🤖 LLM View - CXML Format</h2>
-        <p>Copy the text below and paste it to an LLM for analysis:</p>
-        <textarea id="llm-text" readonly>{html.escape(cxml_text)}</textarea>
-        <div class="copy-hint">
-          💡 <strong>Tip:</strong> Click in the text area and press Ctrl+A (Cmd+A on Mac) to select all, then Ctrl+C (Cmd+C) to copy.
+        <div id="llm-view">
+            <section>
+                <h2>🤖 LLM View - CXML Format</h2>
+                <p>Copy the text below and paste it to an LLM for analysis:</p>
+                <textarea id="llm-text" readonly>{html.escape(cxml_text)}</textarea>
+                <div class="copy-hint">
+                    💡 <strong>Tip:</strong> Click in the text area and press Ctrl+A (Cmd+A on Mac) to select all, then Ctrl+C (Cmd+C) to copy.
+                </div>
+            </section>
         </div>
-      </section>
-    </div>
-  </main>
+    </main>
 </div>
 
 <script>
 function showHumanView() {{
-  document.getElementById('human-view').style.display = 'block';
-  document.getElementById('llm-view').style.display = 'none';
-  document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
-  event.target.classList.add('active');
+    document.getElementById('human-view').style.display = 'block';
+    document.getElementById('llm-view').style.display = 'none';
+    document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
+    event.target.classList.add('active');
 }}
 
 function showLLMView() {{
-  document.getElementById('human-view').style.display = 'none';
-  document.getElementById('llm-view').style.display = 'block';
-  document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
-  event.target.classList.add('active');
+    document.getElementById('human-view').style.display = 'none';
+    document.getElementById('llm-view').style.display = 'block';
+    document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
+    event.target.classList.add('active');
 
-  // Auto-select all text when switching to LLM view for easy copying
-  setTimeout(() => {{
-    const textArea = document.getElementById('llm-text');
-    textArea.focus();
-    textArea.select();
-  }}, 100);
+    // Auto-select all text when switching to LLM view for easy copying
+    setTimeout(() => {{
+        const textArea = document.getElementById('llm-text');
+        textArea.focus();
+        textArea.select();
+    }}, 100);
 }}
 </script>
 </body>
@@ -476,6 +512,12 @@ def main() -> int:
     ap.add_argument("-o", "--out", help="Output HTML file path (default: temporary file derived from repo name)")
     ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
     ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
+    # --- New Arguments for Glob-based Filtering ---
+    ap.add_argument("--include-globs", nargs='*', default=[],
+                    help="Globs to **include** (e.g., '*.py', 'src/*'). If provided, only files matching one of these and NOT an exclude glob are rendered.")
+    ap.add_argument("--exclude-globs", nargs='*', default=[],
+                    help="Globs to **exclude** (e.g., 'tests/*', 'docs/**'). Exclusion takes precedence over inclusion.")
+    # ----------------------------------------------
     args = ap.parse_args()
 
     # Set default output path if not provided
@@ -492,7 +534,8 @@ def main() -> int:
         print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
 
         print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
-        infos = collect_files(repo_dir, args.max_bytes)
+        # Pass new glob arguments to collect_files
+        infos = collect_files(repo_dir, args.max_bytes, args.include_globs, args.exclude_globs)
         rendered_count = sum(1 for i in infos if i.decision.include)
         skipped_count = len(infos) - rendered_count
         print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
