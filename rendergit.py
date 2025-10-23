@@ -95,7 +95,7 @@ def looks_binary(path: pathlib.Path) -> bool:
         # If unreadable, treat as binary to be safe
         return True
 
-# --- Modified Function Signature and Logic for Globs ---
+
 def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int,
                 include_globs: List[str], exclude_globs: List[str]) -> FileInfo:
     rel_path_obj = path.relative_to(repo_root)
@@ -146,13 +146,11 @@ def collect_files(repo_root: pathlib.Path, max_bytes: int,
             # Pass globs to decide_file
             infos.append(decide_file(p, repo_root, max_bytes, include_globs, exclude_globs))
     return infos
-# -----------------------------------------------------------------------------
+
 
 def generate_tree_fallback(root: pathlib.Path) -> str:
     """Minimal tree-like output if `tree` command is missing."""
     lines: List[str] = []
-    # Removed prefix_stack as it was unused
-    # prefix_stack: List[str] = []
 
     def walk(dir_path: pathlib.Path, prefix: str = ""):
         entries = [e for e in dir_path.iterdir() if e.name != ".git"]
@@ -305,7 +303,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
         render_skip_list("Skipped large files", skipped_large)
     )
 
-    # HTML with left sidebar TOC (rest of build_html is unchanged)
+    # HTML with left sidebar TOC
     return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -421,7 +419,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
             <div><strong>Repository:</strong> <a href="{html.escape(repo_url)}">{html.escape(repo_url)}</a></div>
             <small><strong>HEAD commit:</strong> {html.escape(head_commit)}</small>
             <div class="counts">
-                <strong>Total files:</strong> {total_files} · <strong>Rendered:</strong> {len(rendered)} · <strong>Skipped:</strong> {len(total_files) - len(rendered)}
+                <strong>Total files:</strong> {total_files} · <strong>Rendered:</strong> {len(rendered)} · <strong>Skipped:</strong> {total_files - len(rendered)}
             </div>
             </div>
         </section>
@@ -512,12 +510,10 @@ def main() -> int:
     ap.add_argument("-o", "--out", help="Output HTML file path (default: temporary file derived from repo name)")
     ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
     ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
-    # --- New Arguments for Glob-based Filtering ---
     ap.add_argument("--include-globs", nargs='*', default=[],
                     help="Globs to **include** (e.g., '*.py', 'src/*'). If provided, only files matching one of these and NOT an exclude glob are rendered.")
     ap.add_argument("--exclude-globs", nargs='*', default=[],
                     help="Globs to **exclude** (e.g., 'tests/*', 'docs/**'). Exclusion takes precedence over inclusion.")
-    # ----------------------------------------------
     args = ap.parse_args()
 
     # Set default output path if not provided
@@ -560,4 +556,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
