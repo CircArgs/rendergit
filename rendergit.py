@@ -50,8 +50,14 @@ def run(cmd: List[str], cwd: str | None = None, check: bool = True) -> subproces
     return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
 
 
-def git_clone(url: str, dst: str) -> None:
-    run(["git", "clone", "--depth", "1", url, dst])
+# --- MODIFIED: git_clone to accept a branch argument ---
+def git_clone(url: str, dst: str, branch: str | None = None) -> None:
+    cmd = ["git", "clone", "--depth", "1"]
+    if branch:
+        cmd.extend(["--branch", branch])
+    cmd.extend([url, dst])
+    run(cmd)
+# ------------------------------------------------------
 
 
 def git_head_commit(repo_dir: str) -> str:
@@ -110,7 +116,6 @@ def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int,
         return FileInfo(path, rel, size, RenderDecision(False, "ignored"))
 
     # 2. Check exclusion globs (precedence 2)
-    # Use PurePath for matching the relative path string
     for glob in exclude_globs:
         if pathlib.PurePath(rel).match(glob):
             return FileInfo(path, rel, size, RenderDecision(False, "excluded_glob"))
@@ -123,7 +128,6 @@ def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int,
                 is_included = True
                 break
         if not is_included:
-            # File is NOT matched by any include glob, so exclude it.
             return FileInfo(path, rel, size, RenderDecision(False, "included_glob"))
 
     # 4. Check size and binary status (precedence 4)
@@ -143,7 +147,6 @@ def collect_files(repo_root: pathlib.Path, max_bytes: int,
         if p.is_symlink():
             continue
         if p.is_file():
-            # Pass globs to decide_file
             infos.append(decide_file(p, repo_root, max_bytes, include_globs, exclude_globs))
     return infos
 
@@ -514,6 +517,9 @@ def main() -> int:
                     help="Globs to **include** (e.g., '*.py', 'src/*'). If provided, only files matching one of these and NOT an exclude glob are rendered.")
     ap.add_argument("--exclude-globs", nargs='*', default=[],
                     help="Globs to **exclude** (e.g., 'tests/*', 'docs/**'). Exclusion takes precedence over inclusion.")
+    # --- NEW ARGUMENT ---
+    ap.add_argument("--branch", help="Specific Git branch, tag, or commit to clone (e.g., 'develop', 'v1.0.0'). Defaults to the repository's main branch.")
+    # --------------------
     args = ap.parse_args()
 
     # Set default output path if not provided
@@ -525,12 +531,17 @@ def main() -> int:
 
     try:
         print(f"📁 Cloning {args.repo_url} to temporary directory: {repo_dir}", file=sys.stderr)
-        git_clone(args.repo_url, str(repo_dir))
+        
+        # --- MODIFIED CALL TO git_clone ---
+        if args.branch:
+            print(f"   (Using branch/ref: {args.branch})", file=sys.stderr)
+        git_clone(args.repo_url, str(repo_dir), args.branch)
+        # ----------------------------------
+        
         head = git_head_commit(str(repo_dir))
         print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
 
         print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
-        # Pass new glob arguments to collect_files
         infos = collect_files(repo_dir, args.max_bytes, args.include_globs, args.exclude_globs)
         rendered_count = sum(1 for i in infos if i.decision.include)
         skipped_count = len(infos) - rendered_count
